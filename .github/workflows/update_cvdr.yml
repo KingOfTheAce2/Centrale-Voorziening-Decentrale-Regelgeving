@@ -1,0 +1,55 @@
+# .github/workflows/update_cvdr.yml
+
+name: CVDR Data Crawler and Uploader
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+  # Runs on a schedule (every day at 03:00 UTC)
+  schedule:
+    - cron: '0 3 * * *'
+
+jobs:
+  crawl_and_upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355 # Set timeout slightly less than the 6-hour (360 min) limit
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache Pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Crawler Script
+        env:
+          # The HF_TOKEN is passed as an environment variable to the script
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python cvdr_crawler.py
+      
+      - name: Commit state file # Optional but recommended
+        run: |
+          git config --global user.name 'GitHub Actions'
+          git config --global user.email 'github-actions@github.com'
+          git add crawler_state.json
+          # Only commit if there are changes
+          git diff --staged --quiet || git commit -m "Update crawler state"
+          git push
+        # This step will fail if there are no changes, so we add a condition
+        continue-on-error: true
