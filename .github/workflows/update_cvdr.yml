@@ -12,6 +12,8 @@ on:
 
 jobs:
   crawl_and_upload:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 355 # Set timeout slightly less than the 6-hour (360 min) limit
 
