@@ -91,10 +91,34 @@ def parse_sru_response(xml_content: str) -> (list, int):
     }
     try:
         root = ET.fromstring(xml_content)
-        total_records = int(root.find("sru:numberOfRecords", ns).text)
-        records = root.findall(".//sru:recordData", ns)
+
+        if root.tag.endswith("explainResponse"):
+            logging.error(
+                "Received explain response\u2014check query parameters"
+            )
+            return [], 0
+
+        count_elem = root.find("sru:numberOfRecords", ns)
+        if count_elem is None or count_elem.text is None:
+            diag = root.find(".//sru:diagnostics", ns)
+            if diag is not None:
+                logging.error(
+                    "SRU diagnostics: %s",
+                    ET.tostring(diag, encoding="unicode"),
+                )
+            else:
+                logging.error(
+                    "SRU response missing <numberOfRecords> element"
+                )
+            return [], 0
+
+        total_records = int(count_elem.text)
+
+        records = (
+            root.findall(".//sru:recordData", ns) if total_records > 0 else []
+        )
         return records, total_records
-    except (ET.ParseError, AttributeError) as e:
+    except (ET.ParseError, AttributeError, ValueError) as e:
         logging.error(f"Failed to parse SRU XML response: {e}")
         return [], 0
 
