@@ -16,10 +16,15 @@ from requests.packages.urllib3.util.retry import Retry
 # --- Configuration ---
 SRU_ENDPOINT = "https://zoekservice.overheid.nl/sru/Search"
 SRU_PARAMS = {
-    "x-connection": "cvdr",
+    # NOTE: according to the SRU 2.0 manual the parameter name is
+    # ``xconnection`` (without a dash). Using the wrong parameter leads to a
+    # ``406 Not Acceptable`` response from the API.  Setting ``httpAccept``
+    # ensures we always request an XML response.
+    "xconnection": "cvdr",
     "operation": "searchRetrieve",
     "version": "2.0",
-    "query": 'cql.textAndIndexes="*"'
+    "query": 'cql.textAndIndexes="*"',
+    "httpAccept": "application/xml",
 }
 HF_REPO_ID = "vGassen/Dutch_Centrale_Voorziening_Decentrale_Regelgeving"
 OUTPUT_FILE = "cvdr_data.jsonl"
