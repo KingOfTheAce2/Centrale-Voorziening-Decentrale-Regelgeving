@@ -1,0 +1,6 @@
+# requirements.txt
+requests
+beautifulsoup4
+datasets
+huggingface_hub
+lxml
