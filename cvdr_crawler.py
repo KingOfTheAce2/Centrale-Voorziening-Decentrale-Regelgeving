@@ -3,15 +3,15 @@ import os
 import time
 import json
 import logging
-import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from bs4 import BeautifulSoup
-from datasets import load_dataset, Dataset
-from huggingface_hub import HfApi, HfFolder
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
+import urllib.request
+import urllib.error
+from html.parser import HTMLParser
+import subprocess
+import tempfile
+import shutil
 
 # --- Configuration ---
 SRU_ENDPOINT = "https://zoekservice.overheid.nl/sru/Search"
@@ -40,12 +40,46 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-def setup_requests_session() -> requests.Session:
-    """Sets up a requests session with retry logic."""
-    session = requests.Session()
-    retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    return session
+class TextExtractor(HTMLParser):
+    """Simple HTML text extractor that skips script and style tags."""
+
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip = True
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        return " ".join(" ".join(self._parts).split())
+
+
+def fetch_with_retries(url: str, params: dict | None = None, *, retries: int = 5) -> bytes:
+    """Fetches a URL with basic retry logic using urllib."""
+    if params:
+        query = urllib.parse.urlencode(params)
+        url = f"{url}?{query}"
+
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "cvdr-crawler"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.URLError as e:
+            logging.warning("Fetch failed (%s). Attempt %d/%d", e, attempt + 1, retries)
+            time.sleep(1)
+    raise RuntimeError(f"Failed to fetch {url} after {retries} attempts")
+
 
 def load_crawler_state() -> dict:
     """Loads the crawler state from a local JSON file."""
@@ -63,24 +97,31 @@ def save_crawler_state(state: dict):
         json.dump(state, f, indent=4)
     logging.info(f"Saved crawler state: {state}")
 
-def get_existing_urls_from_hf() -> set:
-    """
-    Downloads the 'URL' column from the Hugging Face dataset to prevent duplicates.
-    Uses streaming to avoid high memory usage on large datasets.
-    """
+def get_existing_urls_from_hf(token: str) -> set:
+    """Fetches existing URLs from the Hugging Face dataset via the raw file."""
+
     logging.info(f"Fetching existing URLs from Hugging Face repo: {HF_REPO_ID}")
-    existing_urls = set()
+    existing_urls: set[str] = set()
+    raw_url = (
+        f"https://huggingface.co/datasets/{HF_REPO_ID}/raw/main/{OUTPUT_FILE}"
+    )
+    req = urllib.request.Request(raw_url)
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+
     try:
-        # Use streaming to efficiently get URLs without downloading the whole dataset
-        dataset = load_dataset(HF_REPO_ID, split="train", streaming=True)
-        for record in dataset:
-            if "URL" in record:
-                existing_urls.add(record["URL"])
-        logging.info(f"Found {len(existing_urls)} existing URLs in the dataset.")
-    except Exception as e:
-        logging.warning(
-            f"Could not load existing dataset from Hugging Face (maybe it's empty or new?): {e}"
-        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            for line in resp.read().decode("utf-8").splitlines():
+                try:
+                    record = json.loads(line)
+                    if "URL" in record:
+                        existing_urls.add(record["URL"])
+                except json.JSONDecodeError:
+                    continue
+        logging.info("Found %d existing URLs in the dataset", len(existing_urls))
+    except urllib.error.URLError as e:
+        logging.warning("Could not load existing dataset from Hugging Face: %s", e)
+
     return existing_urls
 
 def parse_sru_response(xml_content: str) -> (list, int):
@@ -122,40 +163,52 @@ def parse_sru_response(xml_content: str) -> (list, int):
         logging.error(f"Failed to parse SRU XML response: {e}")
         return [], 0
 
-def crawl_and_clean_document(session: requests.Session, url: str) -> str | None:
+def crawl_and_clean_document(url: str) -> str | None:
     """Crawls a given URL and returns its clean text content."""
     try:
-        response = session.get(url, timeout=30)
-        response.raise_for_status()
-        # Ensure content is decoded correctly
-        response.encoding = response.apparent_encoding
-        soup = BeautifulSoup(response.text, "lxml")
-        
-        # Strip all script and style elements
-        for script_or_style in soup(["script", "style"]):
-            script_or_style.decompose()
-
-        # Get text, use a separator to preserve context, and clean up whitespace
-        text = soup.get_text(separator=' ', strip=True)
-        return ' '.join(text.split()) # Normalize whitespace
-    except requests.RequestException as e:
-        logging.warning(f"Failed to crawl document URL {url}: {e}")
+        html_bytes = fetch_with_retries(url)
+        html_str = html_bytes.decode("utf-8", errors="ignore")
+        parser = TextExtractor()
+        parser.feed(html_str)
+        return parser.get_text()
     except Exception as e:
-        logging.error(f"An unexpected error occurred while cleaning {url}: {e}")
-    return None
+        logging.warning("Failed to crawl or parse document %s: %s", url, e)
+        return None
+
+
+def push_dataset_to_hf(file_path: str, repo_id: str, token: str):
+    """Pushes the given file to a Hugging Face dataset repository using git."""
+    if not token:
+        logging.warning("No HF_TOKEN provided; skipping upload.")
+        return
+
+    tmpdir = tempfile.mkdtemp()
+    repo_url = f"https://{token}@huggingface.co/datasets/{repo_id}"
+
+    try:
+        subprocess.run(["git", "clone", repo_url, tmpdir], check=True)
+        dest = os.path.join(tmpdir, os.path.basename(file_path))
+        if os.path.exists(dest):
+            with open(dest, "a", encoding="utf-8") as dst, open(file_path, "r", encoding="utf-8") as src:
+                dst.write(src.read())
+        else:
+            shutil.copy(file_path, dest)
+        subprocess.run(["git", "add", os.path.basename(file_path)], cwd=tmpdir, check=True)
+        subprocess.run(["git", "commit", "-m", "Update dataset"], cwd=tmpdir, check=True)
+        subprocess.run(["git", "push"], cwd=tmpdir, check=True)
+        logging.info("Successfully pushed data to Hugging Face.")
+    except subprocess.CalledProcessError as e:
+        logging.error("Failed to push dataset to Hugging Face: %s", e)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 def main():
     """Main function to run the crawler and uploader."""
     start_time = datetime.utcnow()
     logging.info("--- Starting CVDR Crawler ---")
 
-    hf_token = os.getenv("HF_TOKEN")
-    if not hf_token:
-        logging.error("HF_TOKEN environment variable not set. Aborting.")
-        return
-    HfFolder.save_token(hf_token)
+    hf_token = os.getenv("HF_TOKEN", "")
 
-    session = setup_requests_session()
     state = load_crawler_state()
 
     if state.get("completed", False):
@@ -164,7 +217,7 @@ def main():
         # For this implementation, we assume a full crawl is a one-off until reset.
         return
 
-    existing_urls = get_existing_urls_from_hf()
+    existing_urls = get_existing_urls_from_hf(hf_token)
     new_records_found = 0
     start_record = state.get("startRecord", 1)
 
@@ -185,13 +238,12 @@ def main():
             logging.info(f"Requesting batch from startRecord: {start_record}")
             
             try:
-                response = session.get(SRU_ENDPOINT, params=params)
-                response.raise_for_status()
-            except requests.RequestException as e:
-                logging.error(f"Failed to fetch SRU batch: {e}. Exiting run.")
+                response_content = fetch_with_retries(SRU_ENDPOINT, params=params)
+            except Exception as e:
+                logging.error("Failed to fetch SRU batch: %s. Exiting run.", e)
                 break
-                
-            records, total_records = parse_sru_response(response.content)
+
+            records, total_records = parse_sru_response(response_content)
 
             if not records:
                 logging.info("No more records found. Crawl is complete.")
@@ -214,7 +266,7 @@ def main():
                     logging.debug(f"Skipping already processed URL: {doc_url}")
                     continue
 
-                content = crawl_and_clean_document(session, doc_url)
+                content = crawl_and_clean_document(doc_url)
                 if content:
                     json_record = {
                         "URL": doc_url,
@@ -241,16 +293,10 @@ def main():
         logging.info("Crawler finished its run.")
 
         if new_records_found > 0:
-            logging.info(f"Found a total of {new_records_found} new records. Pushing to Hugging Face Hub.")
-            try:
-                # Load the newly created JSONL file
-                new_dataset = load_dataset("json", data_files=OUTPUT_FILE, split="train")
-                
-                # Push to hub, appending to the existing dataset
-                new_dataset.push_to_hub(HF_REPO_ID, private=False) # `private=False` makes it a public repo
-                logging.info("Successfully pushed new data to Hugging Face Hub.")
-            except Exception as e:
-                logging.error(f"Failed to push to Hugging Face Hub: {e}")
+            logging.info(
+                f"Found a total of {new_records_found} new records. Pushing to Hugging Face Hub."
+            )
+            push_dataset_to_hf(OUTPUT_FILE, HF_REPO_ID, hf_token)
         else:
             logging.info("No new records found in this run. Nothing to upload.")
 
