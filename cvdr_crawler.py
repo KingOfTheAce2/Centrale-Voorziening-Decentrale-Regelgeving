@@ -30,7 +30,7 @@ SRU_PARAMS = {
     "xconnection": "cvdr",            # collection identifier
     "operation": "searchRetrieve",
     "version": "2.0",
-    "query": 'keyword=""',            # ← match‐all via the empty keyword
+    "query": "cql.allRecords=1",      # ← match‐all using the CQL allRecords index
     "httpAccept": "application/xml",  # ensure XML response
 }
 BATCH_SIZE = 1000
