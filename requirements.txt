@@ -1,1 +1,3 @@
-# requirements.txt
+requests
+lxml
+huggingface_hub
